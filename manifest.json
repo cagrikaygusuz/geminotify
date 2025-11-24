@@ -5,7 +5,8 @@
   "description": "Gemini ve NotebookLM'de cevaplar geldiğinde bildirim gönderir",
   "permissions": [
     "notifications",
-    "tabs"
+    "tabs",
+    "storage"
   ],
   "host_permissions": [
     "https://gemini.google.com/*",

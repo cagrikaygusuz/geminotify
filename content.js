@@ -31,76 +31,271 @@
 
   // Bildirim gönder
   function sendNotification(title, message) {
-    chrome.runtime.sendMessage({
-      type: 'notification',
-      title: title,
-      message: message,
-      url: window.location.href
-    });
+    console.log('[Gemini Notify] Bildirim gönderiliyor:', title, message);
+    try {
+      chrome.runtime.sendMessage({
+        type: 'notification',
+        title: title,
+        message: message,
+        url: window.location.href
+      }, (response) => {
+        if (chrome.runtime.lastError) {
+          console.error('[Gemini Notify] Bildirim hatası:', chrome.runtime.lastError.message);
+        } else if (response && response.success) {
+          console.log('[Gemini Notify] Bildirim başarıyla gönderildi');
+        } else {
+          console.warn('[Gemini Notify] Bildirim yanıtı:', response);
+        }
+      });
+    } catch (error) {
+      console.error('[Gemini Notify] Bildirim gönderme hatası:', error);
+    }
   }
 
   // Gemini sayfasını izle
   function monitorGemini() {
-    let lastUserMessage = '';
-    let isThinking = false;
-    let lastResponseLength = 0;
-
-    // Input alanını izle
-    const inputObserver = new MutationObserver(() => {
-      const inputArea = document.querySelector(geminiSelectors.inputArea);
-      if (inputArea && inputArea.value.trim()) {
-        lastUserMessage = inputArea.value.trim();
+    console.log('[Gemini Notify] İzleme başlatılıyor...');
+    
+    let userMessageSent = false;
+    let lastResponseHash = '';
+    let responseCheckCount = 0;
+    let isWaitingForResponse = false;
+    
+    // Gönder butonunu ve input alanını bul
+    function findInputAndButton() {
+      // Farklı selector'ları dene
+      const selectors = [
+        'textarea[aria-label*="prompt"]',
+        'textarea[placeholder*="prompt"]',
+        'textarea[data-placeholder]',
+        'textarea',
+        'div[contenteditable="true"][role="textbox"]'
+      ];
+      
+      let inputArea = null;
+      for (const selector of selectors) {
+        inputArea = document.querySelector(selector);
+        if (inputArea && inputArea.offsetParent !== null) {
+          console.log('[Gemini Notify] Input bulundu:', selector);
+          break;
+        }
       }
-    });
-
-    // Mesaj alanını izle
-    const messageObserver = new MutationObserver(() => {
-      // Düşünme durumunu kontrol et
-      const thinkingElements = document.querySelectorAll(geminiSelectors.thinkingIndicator);
-      const currentlyThinking = thinkingElements.length > 0 && 
-        Array.from(thinkingElements).some(el => el.offsetParent !== null);
-
-      if (currentlyThinking && !isThinking) {
-        isThinking = true;
-        lastResponseLength = 0;
+      
+      // Gönder butonunu bul
+      const buttonSelectors = [
+        'button[aria-label*="Send"]',
+        'button[aria-label*="Gönder"]',
+        'button[type="submit"]',
+        'button[data-testid*="send"]',
+        'button:has(svg)'
+      ];
+      
+      let sendButton = null;
+      for (const selector of buttonSelectors) {
+        const buttons = Array.from(document.querySelectorAll(selector));
+        sendButton = buttons.find(btn => {
+          const text = btn.textContent || btn.getAttribute('aria-label') || '';
+          return text.toLowerCase().includes('send') || 
+                 text.toLowerCase().includes('gönder') ||
+                 btn.querySelector('svg');
+        });
+        if (sendButton) {
+          console.log('[Gemini Notify] Gönder butonu bulundu');
+          break;
+        }
       }
-
-      // Cevapları kontrol et
-      const responseElements = document.querySelectorAll(geminiSelectors.messages);
-      if (responseElements.length > 0) {
-        const latestResponse = Array.from(responseElements).pop();
-        const responseText = latestResponse.textContent || latestResponse.innerText || '';
-        
-        if (isThinking && responseText.length > lastResponseLength && responseText.length > 50) {
-          // Cevap geldi
-          isThinking = false;
-          lastResponseLength = responseText.length;
+      
+      return { inputArea, sendButton };
+    }
+    
+    // Event listener'ları sakla
+    let sendButtonListener = null;
+    let inputListener = null;
+    
+    // Gönder butonuna tıklama olayını dinle
+    function setupSendButtonListener() {
+      const { sendButton } = findInputAndButton();
+      if (sendButton && !sendButton.dataset.notifyListenerAdded) {
+        sendButton.dataset.notifyListenerAdded = 'true';
+        sendButtonListener = () => {
+          console.log('[Gemini Notify] Mesaj gönderildi');
+          userMessageSent = true;
+          isWaitingForResponse = true;
+          responseCheckCount = 0;
+        };
+        sendButton.addEventListener('click', sendButtonListener);
+        console.log('[Gemini Notify] Gönder butonu listener eklendi');
+      }
+    }
+    
+    // Input alanına Enter tuşu ile göndermeyi dinle
+    function setupInputListener() {
+      const { inputArea } = findInputAndButton();
+      if (inputArea && !inputArea.dataset.notifyListenerAdded) {
+        inputArea.dataset.notifyListenerAdded = 'true';
+        inputListener = (e) => {
+          if (e.key === 'Enter' && !e.shiftKey) {
+            console.log('[Gemini Notify] Enter ile mesaj gönderildi');
+            setTimeout(() => {
+              userMessageSent = true;
+              isWaitingForResponse = true;
+              responseCheckCount = 0;
+            }, 100);
+          }
+        };
+        inputArea.addEventListener('keydown', inputListener);
+        console.log('[Gemini Notify] Input listener eklendi');
+      }
+    }
+    
+    // Cevapları kontrol et
+    function checkForResponse() {
+      if (!isWaitingForResponse) return;
+      
+      responseCheckCount++;
+      
+      // Tüm olası cevap alanlarını kontrol et
+      const responseSelectors = [
+        '[data-message-author-role="model"]',
+        '[class*="model-message"]',
+        '[class*="response"]',
+        '[class*="message"]',
+        'div[data-testid*="message"]',
+        'div[role="article"]'
+      ];
+      
+      let foundResponse = null;
+      for (const selector of responseSelectors) {
+        const elements = document.querySelectorAll(selector);
+        if (elements.length > 0) {
+          // En son eklenen mesajı bul
+          const lastElement = Array.from(elements).pop();
+          const text = lastElement.textContent || lastElement.innerText || '';
           
-          if (lastUserMessage) {
-            sendNotification('Gemini Cevap Verdi', 'Sorunuzun cevabı hazır!');
-            lastUserMessage = '';
+          // Kullanıcı mesajı değilse ve yeterince uzunsa
+          if (text.length > 50 && !text.includes('Thinking...') && !text.includes('Düşünüyor')) {
+            const textHash = text.substring(0, 100);
+            if (textHash !== lastResponseHash) {
+              foundResponse = text;
+              lastResponseHash = textHash;
+            }
           }
         }
       }
-    });
-
-    // Sayfa yüklendiğinde observer'ları başlat
-    setTimeout(() => {
-      const inputArea = document.querySelector(geminiSelectors.inputArea);
-      if (inputArea) {
-        inputObserver.observe(document.body, {
-          childList: true,
-          subtree: true,
-          characterData: true
+      
+      // Alternatif: Sayfadaki tüm text içeriğini kontrol et
+      if (!foundResponse) {
+        const allTextElements = document.querySelectorAll('div, p, span');
+        let lastLargeText = '';
+        let lastLargeElement = null;
+        
+        allTextElements.forEach(el => {
+          const text = el.textContent || el.innerText || '';
+          if (text.length > 100 && 
+              el.offsetParent !== null &&
+              !el.querySelector('textarea') &&
+              !el.querySelector('input')) {
+            if (text.length > lastLargeText.length) {
+              lastLargeText = text;
+              lastLargeElement = el;
+            }
+          }
         });
+        
+        if (lastLargeText && lastLargeText !== lastResponseHash) {
+          const textHash = lastLargeText.substring(0, 100);
+          if (textHash !== lastResponseHash && lastLargeText.length > 50) {
+            foundResponse = lastLargeText;
+            lastResponseHash = textHash;
+          }
+        }
       }
-
-      messageObserver.observe(document.body, {
-        childList: true,
-        subtree: true,
-        characterData: true
+      
+      // Düşünme göstergelerini kontrol et
+      const thinkingSelectors = [
+        '[class*="thinking"]',
+        '[class*="loading"]',
+        '[aria-label*="thinking"]',
+        '[aria-label*="loading"]',
+        '*[class*="spinner"]'
+      ];
+      
+      let isThinking = false;
+      for (const selector of thinkingSelectors) {
+        const elements = document.querySelectorAll(selector);
+        if (elements.length > 0) {
+          isThinking = Array.from(elements).some(el => el.offsetParent !== null);
+          if (isThinking) break;
+        }
+      }
+      
+      // Eğer düşünme durumu bitti ve cevap varsa
+      if (foundResponse && !isThinking && userMessageSent) {
+        console.log('[Gemini Notify] Cevap bulundu! Bildirim gönderiliyor...');
+        sendNotification('Gemini Cevap Verdi', 'Sorunuzun cevabı hazır!');
+        userMessageSent = false;
+        isWaitingForResponse = false;
+        lastResponseHash = foundResponse.substring(0, 100);
+      }
+      
+      // 30 saniye sonra timeout
+      if (responseCheckCount > 60) {
+        console.log('[Gemini Notify] Timeout - izleme durduruluyor');
+        isWaitingForResponse = false;
+        userMessageSent = false;
+      }
+    }
+    
+    // Sayfa yüklendiğinde başlat
+    function startMonitoring() {
+      console.log('[Gemini Notify] İzleme başlatıldı');
+      
+      setupSendButtonListener();
+      setupInputListener();
+      
+      // Her 500ms'de bir kontrol et
+      const checkInterval = setInterval(checkForResponse, 500);
+      
+      // Sayfa değiştiğinde yeniden başlat
+      const urlObserver = new MutationObserver(() => {
+        if (location.href !== (window.lastGeminiUrl || '')) {
+          window.lastGeminiUrl = location.href;
+          console.log('[Gemini Notify] Sayfa değişti, yeniden başlatılıyor...');
+          clearInterval(checkInterval);
+          setTimeout(startMonitoring, 1000);
+        }
       });
-    }, 2000);
+      
+      urlObserver.observe(document.body, {
+        childList: true,
+        subtree: true
+      });
+      
+      // DOM değişikliklerini izle (debounce ile)
+      let domCheckTimeout = null;
+      const domObserver = new MutationObserver(() => {
+        // Debounce: 1 saniye içinde sadece bir kez kontrol et
+        if (domCheckTimeout) clearTimeout(domCheckTimeout);
+        domCheckTimeout = setTimeout(() => {
+          setupSendButtonListener();
+          setupInputListener();
+        }, 1000);
+      });
+      
+      domObserver.observe(document.body, {
+        childList: true,
+        subtree: true
+      });
+    }
+    
+    // Sayfa yüklendiğinde başlat
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', () => {
+        setTimeout(startMonitoring, 2000);
+      });
+    } else {
+      setTimeout(startMonitoring, 2000);
+    }
   }
 
   // NotebookLM chat'i izle
